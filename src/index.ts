@@ -54,22 +54,31 @@ type Policy = {
 const policies: Policy[] = [
   {
     effect: "allow",
-    name: "Admin Full Access",
-    description: "Cho phép admin mọi hành động",
+    name: "Owner allow edit",
+    description: "Cho phép người sở hữu tạo",
     condition: {
-      attribute: "$.user.roles",
-      operator: "equals",
-      value: "admin",
+      or: [
+        {
+          attribute: "$.user.id",
+          operator: "equals",
+          value: "$.resource.ownerId",
+        },
+        {
+          attribute: "$.action",
+          operator: "equals",
+          value: "delete",
+        },
+      ],
     },
   },
   {
     effect: "allow",
-    name: "Owner allow edit",
-    description: "Cho phép người sở hữu tạo",
+    name: "Admin Full Access",
+    description: "Cho phép admin mọi hành động",
     condition: {
-      attribute: "$.user.id",
-      operator: "equals",
-      value: "$.resource.ownerId",
+      attribute: "$.user.roles",
+      operator: "contains",
+      value: "admin",
     },
   },
 ];
@@ -77,11 +86,11 @@ const policies: Policy[] = [
 const tempContext: ABACContext = {
   user: {
     id: "123",
-    roles: ["admin"],
+    roles: ["admin1"],
   },
-  action: "read",
+  action: "delete",
   resource: {
-    ownerId: "456",
+    ownerId: "123",
   },
   environment: {
     ip: "192.168.1.200",
@@ -95,21 +104,24 @@ class PolicyDecisionPoint {
     this.policies = policies;
   }
 
-  private getAttributeValue(context: ABACContext, attribute: string): any {
+  private getAttributeValue(context: ABACContext, attribute: string) {
     if (!attribute.startsWith("$.")) return undefined;
     const parts = attribute.replace(/^\$./, "").split(".");
-    let value = context;
+    let value: any = context;
     for (const part of parts) {
       if (value && typeof value === "object" && part in value) {
         value = value[part];
       } else {
-        return undefined;
+        value = undefined;
       }
     }
     return value;
   }
 
-  private evaluateCondition(context: ABACContext, condition: Condition) {
+  private evaluateCondition(
+    context: ABACContext,
+    condition: Condition
+  ): boolean {
     if ("and" in condition) {
       return condition.and.every((subCondition) =>
         this.evaluateCondition(context, subCondition)
@@ -127,14 +139,77 @@ class PolicyDecisionPoint {
     }
 
     const { attribute, operator, value } = condition;
+
+    const dynamicValue = this.getAttributeValue(context, attribute);
+    const conditionValue =
+      this.getAttributeValue(context, value) ||
+      (value.startsWith("$.") ? undefined : value);
+
+    switch (operator) {
+      case "equals":
+        return dynamicValue === conditionValue;
+      case "not_equal":
+        return dynamicValue !== conditionValue;
+      case "greater_than":
+        return dynamicValue > conditionValue;
+      case "greater_than_or_equal":
+        return dynamicValue >= conditionValue;
+      case "less_than":
+        return dynamicValue < conditionValue;
+      case "less_than_or_equal":
+        return dynamicValue <= conditionValue;
+      case "in":
+        return (
+          Array.isArray(conditionValue) && conditionValue.includes(dynamicValue)
+        );
+      case "not_in":
+        return (
+          Array.isArray(conditionValue) &&
+          !conditionValue.includes(dynamicValue)
+        );
+      case "contains":
+        return (
+          Array.isArray(dynamicValue) && dynamicValue.includes(conditionValue)
+        );
+      default:
+        return false; // Không hỗ trợ operator này
+    }
   }
 
   public evaluate(context: ABACContext): "allow" | "deny" {
-    console.log(this.getAttributeValue(context, "$.user.id"));
-    return "allow";
+    let allow = false;
+    let deny = false;
+
+    for (const policy of this.policies) {
+      const conditionsMet = this.evaluateCondition(context, policy.condition);
+      console.log(conditionsMet);
+      if (conditionsMet) {
+        if (policy.effect === "deny") {
+          deny = true;
+        } else if (policy.effect === "allow") {
+          allow = true;
+        }
+      }
+    }
+
+    return deny ? "deny" : allow ? "allow" : "deny";
+  }
+}
+
+class PolicyEnforcementPoint {
+  private pdp: PolicyDecisionPoint;
+
+  constructor(pdp: PolicyDecisionPoint) {
+    this.pdp = pdp;
+  }
+
+  public enforce(context: any): boolean {
+    const decision = this.pdp.evaluate(context);
+    return decision === "allow";
   }
 }
 
 const test = new PolicyDecisionPoint(policies);
+const pep = new PolicyEnforcementPoint(test);
 
-test.evaluate(tempContext);
+console.log(pep.enforce(tempContext));
