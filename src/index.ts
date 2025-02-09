@@ -1,17 +1,39 @@
-type ABACContext = {
+enum ContextResourceEnum {
+  POST = "post",
+  USER = "user",
+}
+
+type ContextResource = {
+  [ContextResourceEnum.POST]: {
+    ownerId: string;
+  };
+  [ContextResourceEnum.USER]: {
+    roles: string[];
+    department: string;
+  };
+};
+
+type BaseContext<R> = {
   user: {
     id: string;
     roles: string[];
   };
-  resource: {
-    ownerId: string;
-  };
+  resource: R;
   action: "read" | "write" | "edit" | "delete";
   environment: {
     ip: string;
     timestamp: Date;
   };
 };
+
+type ContextBuilder<T extends { [index: string]: any }> = {
+  [M in keyof T]: T[M] extends object
+    ? { type: M; context: BaseContext<T[M]> }
+    : never;
+};
+
+type ABACContextBuilder =
+  ContextBuilder<ContextResource>[keyof ContextBuilder<ContextResource>];
 
 type Operator =
   | "equals"
@@ -21,8 +43,7 @@ type Operator =
   | "greater_than_or_equal"
   | "less_than"
   | "less_than_or_equal"
-  | "in"
-  | "not_in";
+  | "in";
 
 type BaseCondition = {
   attribute: string;
@@ -51,99 +72,80 @@ type Policy = {
   condition: Condition;
 };
 
-const policies: Policy[] = [
-  {
-    effect: "allow",
-    name: "Owner allow edit",
-    description: "Cho phép người sở hữu tạo",
-    condition: {
-      or: [
-        {
-          attribute: "$.user.id",
-          operator: "equals",
-          value: "$.resource.ownerId",
-        },
-        {
-          attribute: "$.action",
-          operator: "equals",
-          value: "delete",
-        },
-      ],
-    },
-  },
-  {
-    effect: "allow",
-    name: "Admin Full Access",
-    description: "Cho phép admin mọi hành động",
-    condition: {
-      attribute: "$.user.roles",
-      operator: "contains",
-      value: "admin",
-    },
-  },
-];
-
-const tempContext: ABACContext = {
-  user: {
-    id: "123",
-    roles: ["admin1"],
-  },
-  action: "delete",
-  resource: {
-    ownerId: "123",
-  },
-  environment: {
-    ip: "192.168.1.200",
-    timestamp: new Date(),
-  },
-};
-
 class PolicyDecisionPoint {
   private policies: Policy[];
   constructor(policies: Policy[]) {
     this.policies = policies;
   }
 
-  private getAttributeValue(context: ABACContext, attribute: string) {
-    if (!attribute.startsWith("$.")) return undefined;
+  private getAttributeContextValue(
+    context: ABACContextBuilder["context"],
+    attribute: string
+  ) {
     const parts = attribute.replace(/^\$./, "").split(".");
     let value: any = context;
     for (const part of parts) {
       if (value && typeof value === "object" && part in value) {
         value = value[part];
       } else {
-        value = undefined;
+        value = null;
       }
     }
     return value;
   }
 
+  private getDynamicValue(
+    context: ABACContextBuilder["context"],
+    attribute: string
+  ) {
+    if (!attribute.startsWith("$.")) return null;
+    return this.getAttributeContextValue(context, attribute);
+  }
+
+  private getConditionValue(
+    value: any,
+    context: ABACContextBuilder["context"]
+  ) {
+    if (typeof value == "string" && value.startsWith("$.")) {
+      return this.getAttributeContextValue(context, value);
+    } else {
+      return value;
+    }
+  }
+
   private evaluateCondition(
-    context: ABACContext,
+    contextBuilder: ABACContextBuilder,
     condition: Condition
   ): boolean {
     if ("and" in condition) {
       return condition.and.every((subCondition) =>
-        this.evaluateCondition(context, subCondition)
+        this.evaluateCondition(contextBuilder, subCondition)
       );
     }
 
     if ("or" in condition) {
       return condition.or.some((subCondition) =>
-        this.evaluateCondition(context, subCondition)
+        this.evaluateCondition(contextBuilder, subCondition)
       );
     }
 
     if ("not" in condition) {
-      return !this.evaluateCondition(context, condition.not);
+      return !this.evaluateCondition(contextBuilder, condition.not);
     }
 
     const { attribute, operator, value } = condition;
 
-    const dynamicValue = this.getAttributeValue(context, attribute);
-    const conditionValue =
-      this.getAttributeValue(context, value) ||
-      (value.startsWith("$.") ? undefined : value);
+    const dynamicValue = this.getDynamicValue(
+      contextBuilder.context,
+      attribute
+    );
+
+    const conditionValue = this.getConditionValue(
+      value,
+      contextBuilder.context
+    );
+
+    if (!dynamicValue || !conditionValue) return false;
 
     switch (operator) {
       case "equals":
@@ -162,27 +164,24 @@ class PolicyDecisionPoint {
         return (
           Array.isArray(conditionValue) && conditionValue.includes(dynamicValue)
         );
-      case "not_in":
-        return (
-          Array.isArray(conditionValue) &&
-          !conditionValue.includes(dynamicValue)
-        );
       case "contains":
         return (
           Array.isArray(dynamicValue) && dynamicValue.includes(conditionValue)
         );
       default:
-        return false; // Không hỗ trợ operator này
+        return false;
     }
   }
 
-  public evaluate(context: ABACContext): "allow" | "deny" {
+  public evaluate(contextBuilder: ABACContextBuilder): "allow" | "deny" {
     let allow = false;
     let deny = false;
 
     for (const policy of this.policies) {
-      const conditionsMet = this.evaluateCondition(context, policy.condition);
-      console.log(conditionsMet);
+      const conditionsMet = this.evaluateCondition(
+        contextBuilder,
+        policy.condition
+      );
       if (conditionsMet) {
         if (policy.effect === "deny") {
           deny = true;
@@ -208,6 +207,49 @@ class PolicyEnforcementPoint {
     return decision === "allow";
   }
 }
+
+const policies: Policy[] = [
+  {
+    effect: "allow",
+    name: "Admin Full Access",
+    description: "Cho phép admin mọi hành động",
+    condition: {
+      attribute: "$.user.roles",
+      operator: "contains",
+      value: "admin",
+    },
+  },
+  {
+    effect: "deny",
+    name: "",
+    description: "",
+    condition: {
+      not: {
+        attribute: "$.environment.ip",
+        operator: "equals",
+        value: "192.168.1.200",
+      },
+    },
+  },
+];
+
+const tempContext: ABACContextBuilder = {
+  type: ContextResourceEnum.POST,
+  context: {
+    user: {
+      id: "123",
+      roles: ["admin"],
+    },
+    action: "delete",
+    resource: {
+      ownerId: "123",
+    },
+    environment: {
+      ip: "192.168.1.200",
+      timestamp: new Date(),
+    },
+  },
+};
 
 const test = new PolicyDecisionPoint(policies);
 const pep = new PolicyEnforcementPoint(test);
